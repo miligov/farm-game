@@ -684,7 +684,7 @@ function share(txt){
 /* ---------- реклама за вознаграждение ---------- */
 var adBusy=false;
 function watchAd(cb){
-  if(adBusy)return;
+  if(adBusy){toast('📺 Дождись окончания текущего ролика');if(cb)cb(false);return;}
   if(!VK.ready){cb(true);return;}   /* вне ВК — засчитываем, чтобы можно было тестировать */
   adBusy=true;toast('📺 Загружаем ролик…');
   bridge.send('VKWebAppShowNativeAds',{ad_format:'reward'}).then(function(d){
@@ -693,6 +693,8 @@ function watchAd(cb){
     else{sfx('err');toast('Реклама недоступна, попробуй позже');}
   }).catch(function(){adBusy=false;sfx('err');toast('Реклама недоступна, попробуй позже');});
 }
+var AD_COINS_CD=5*60*1000,AD_BARN_CD=20*60*1000;
+function adLeft(at,cd){return Math.max(0,cd-(now()-(at||0)));}
 
 /* ============================================================
    5. СОХРАНЕНИЕ
@@ -721,6 +723,8 @@ var P={
   duckPats:0,fairUntil:0,fairNext:0,fairDone:0,helperUntil:0,helpDate:0,
   streak:0,streakDate:0,
   fairOrders:[],q:null,qClaim:null,
+  fest:null,festNext:0,festBest:0,festPlays:0,
+  adCoinsAt:0,adBarnAt:0,
   tutor:0
 };
 function save(){
@@ -738,7 +742,7 @@ function applySave(o){
   ['coins','lvl','xp','plotsOpen','plotLvl','wheelDate','petPats','barnCap','totalHarvest','totalOrders',
    'totalCoins','adFree','dailyDate','dailyDone','tutor','era','nightOn',
    'qDate','fairUntil','fairNext','fairDone','helperUntil','duckPats','helpDate',
-   'streak','streakDate'].forEach(function(k){
+   'streak','streakDate','festNext','festBest','festPlays','adCoinsAt','adBarnAt'].forEach(function(k){
     if(typeof o[k]==='number')P[k]=o[k];
   });
   if(!P.plotLvl)P.plotLvl=1;
@@ -756,6 +760,7 @@ function applySave(o){
   if(o.q&&typeof o.q==='object')P.q=o.q;
   if(o.qClaim&&typeof o.qClaim==='object')P.qClaim=o.qClaim;
   if(Array.isArray(o.fairOrders))P.fairOrders=o.fairOrders;
+  if(o.fest&&typeof o.fest==='object')P.fest=o.fest;
   if(!P.penLvl||typeof P.penLvl!=='object')P.penLvl={};
   /* цеха: подстраховка старых сохранений — уровни и базовое время рецепта */
   P.machines.forEach(function(m){
@@ -2483,14 +2488,17 @@ function plantCrop(i,cropId){
 /* Амбар забит — предлагаем бесплатное место за ролик.
    Это самый честный момент для рекламы: игрок сам упёрся в лимит. */
 function askBarnAd(){
+  var left=adLeft(P.adBarnAt,AD_BARN_CD);
   modal('barn','Амбар переполнен',
-    'Урожай некуда складывать.<br>Освободи место — или расширь склад.',
-    [{t:'📺 +10 мест бесплатно',c:'ad',f:function(){
+    'Урожай некуда складывать.<br>Освободи место — или расширь склад.'+
+    (left>0?'<br><span class="muted">Бесплатное расширение через '+mmss(left/1000)+'</span>':''),
+    [{t:left>0?'📺 Через '+mmss(left/1000):'📺 +10 мест бесплатно',c:'ad',f:function(){
+       if(adLeft(P.adBarnAt,AD_BARN_CD)>0){toast('Новое расширение будет позже');return;}
        var btns=document.querySelectorAll('#mBtns button');
        for(var i=0;i<btns.length;i++)btns[i].disabled=true;
        watchAd(function(ok){
          if(!ok){for(var i=0;i<btns.length;i++)btns[i].disabled=false;return;}
-         P.barnCap+=10;
+         P.barnCap+=10;P.adBarnAt=now();
          sfx('build');haptic('medium');save();paintAll();
          toast('🏚 Амбар: +10 мест');
          closeModal();
@@ -2512,6 +2520,7 @@ function harvestPlot(i,silent){
   p.crop=null;p.at=0;
   P.totalHarvest+=got;
   qAdd('h',got);
+  festivalAdd('crop',got);
   ach('firstHarvest','Первый урожай! 🌾');
   if(P.totalHarvest>=10)ach('tenHarvest','10 урожаев! 🌾🎉');
   addXp(d.xp * got);
@@ -2644,6 +2653,7 @@ function collectAnimal(idx,silent){
     if(!silent){sfx('err');toast('🏚 Амбар переполнен!');}
     return false;
   }
+  festivalAdd('animal',got);
   ach('firstEgg','Первое яйцо! 🥚');
   a.fedAt=0;
   addXp(d.xp*got);
@@ -2741,6 +2751,7 @@ function collectCook(mi,qi,silent){
   }
   m.queue.splice(qi,1);
   qAdd('c',1);
+  festivalAdd('cook',1);
   addXp(Math.round(q.xp*(1+0.25*(machLvl(m)-1))));
   if(!silent){
     sfx('done');haptic('medium');
@@ -2761,6 +2772,14 @@ function collectAllCooks(){
   return n;
 }
 /* ускорить всё производство за рекламу */
+function hasAnythingToSpeed(){
+  var i,j;
+  for(i=0;i<P.plots.length;i++)if(P.plots[i].crop&&plotState(P.plots[i])==='grow')return true;
+  for(i=0;i<P.animals.length;i++)if(animalState(P.animals[i])==='grow')return true;
+  for(i=0;i<P.machines.length;i++)for(j=0;j<P.machines[i].queue.length;j++)
+    if(!cookReady(P.machines[i].queue[j]))return true;
+  return false;
+}
 function speedUpAll(){
   var any=false;
   P.machines.forEach(function(m){
@@ -2808,6 +2827,7 @@ function deliverOrder(oid){
   if(boostOn())o.coins=Math.round(o.coins*2);
   P.coins+=o.coins;P.totalCoins+=o.coins;P.totalOrders++;
   qAdd('o',1);
+  festivalAdd('order',1);
   addXp(o.xp);
   P.orders.splice(idx,1);
   sfx('order');haptic('medium');
@@ -3208,7 +3228,7 @@ function stepFx(dt){
   stepGifts(dt);stepCoinRain(dt);stepTruck(dt);
   stepDuck(dt);stepFair(dt);stepHelper(dt);stepPetals(dt);
   stepNight(dt);stepFireflies(dt);stepPetGame(dt);stepButterflyGame(dt);stepSeason(dt);
-  stepCatPrank(dt);
+  stepCatPrank(dt);stepFestival(dt);
 }
 /* ---------- КОТ ---------- */
 function stepCat(dt){
@@ -4415,6 +4435,7 @@ function render(dt){
   drawCoinRain();
   drawTruck();
   drawBoostChip();
+  drawFestivalChip();
   /* частицы */
   for(var p=0;p<G.parts.length;p++){
     var q=G.parts[p];
@@ -5387,6 +5408,7 @@ function deliverFair(oid){
   var pay=Math.round(o.coins*boostMult());
   P.coins+=pay;P.totalCoins+=pay;
   P.fairDone=(P.fairDone||0)+1;
+  festivalAdd('fair',1);
   addXp(o.xp);
   P.fairOrders.splice(idx,1);
   sfx('order');haptic('medium');
@@ -5662,6 +5684,195 @@ function claimQuest(id){
     },1400);
   }
   save();paintAll();
+}
+
+/* ============================================================
+   14c. ФЕСТИВАЛЬ УРОЖАЯ
+   Короткий забег на 90 секунд. Очки получают все способы игры,
+   а награда хранится в сохранении до момента получения.
+   ============================================================ */
+var FEST_DURATION=90*1000,FEST_COOLDOWN=20*60*1000;
+var FEST_GOALS=[
+  {score:12,coins:100,xp:20,wheat:0,n:'Бронзовая корзина'},
+  {score:30,coins:240,xp:45,wheat:5,n:'Серебряная корзина'},
+  {score:55,coins:500,xp:90,wheat:12,n:'Золотой сундук'}
+];
+var FEST_POINTS={crop:1,animal:2,cook:4,order:10,fair:8};
+function festivalState(){
+  if(!P.fest||typeof P.fest!=='object')P.fest={active:false,score:0,start:0,end:0,extended:0,done:false,claimed:true,reward:null};
+  var f=P.fest;
+  if(typeof f.score!=='number'||!isFinite(f.score))f.score=0;
+  f.score=Math.max(0,Math.floor(f.score));
+  if(!f.reward||typeof f.reward!=='object')f.reward=null;
+  return f;
+}
+function festivalActive(){
+  var f=festivalState();
+  return !!(f.active&&!f.done&&now()<f.end);
+}
+function festivalTier(score){
+  var tier=-1;
+  for(var i=0;i<FEST_GOALS.length;i++)if(score>=FEST_GOALS[i].score)tier=i;
+  return tier;
+}
+function festivalRewardText(r,mult){
+  if(!r)return '';
+  mult=mult||1;
+  return icoTag('coin',18)+' <b>'+fmt(r.coins*mult)+'</b> &nbsp; '+
+    icoTag('star',18)+' <b>'+fmt(r.xp*mult)+'</b>'+
+    (r.wheat?' &nbsp; 🌾 <b>'+(r.wheat*mult)+'</b>':'');
+}
+function startFestival(skipCooldown){
+  var f=festivalState();
+  if(festivalActive()){toast('Фестиваль уже идёт!');return;}
+  if(f.done&&!f.claimed){showFestivalResult();return;}
+  if(!skipCooldown&&now()<(P.festNext||0)){
+    sfx('err');toast('Новый фестиваль через '+mmss(((P.festNext||0)-now())/1000));return;
+  }
+  P.fest={active:true,score:0,start:now(),end:now()+FEST_DURATION,extended:0,done:false,claimed:false,reward:null};
+  G.festGoal=0;
+  closePanel();
+  sfx('level');haptic('heavy');confettiBurst();
+  toast('🎪 Фестиваль начался! 90 секунд — собирай, готовь и доставляй!');
+  save();paintAll();
+}
+function festivalAdd(kind,n){
+  if(!festivalActive())return;
+  var f=festivalState(),pts=(FEST_POINTS[kind]||0)*(n||1);
+  if(!pts)return;
+  var oldTier=festivalTier(f.score);
+  f.score+=Math.round(pts);
+  var newTier=festivalTier(f.score);
+  if(newTier>oldTier){
+    sfx('win');haptic('medium');
+    toast('🎉 '+FEST_GOALS[newTier].n+' открыта! Очки: '+f.score);
+  }
+  if(f.score>=FEST_GOALS[FEST_GOALS.length-1].score)finishFestival(true);
+  save();
+}
+function extendFestival(){
+  var f=festivalState();
+  if(!festivalActive()||f.extended)return false;
+  f.extended=1;f.end+=30*1000;
+  sfx('level');haptic('medium');confettiBurst();
+  toast('⏱ +30 секунд к фестивалю!');
+  save();paintAll();return true;
+}
+function finishFestival(early){
+  var f=festivalState();
+  if(!f.active||f.done)return;
+  f.active=false;f.done=true;f.claimed=false;
+  var tier=festivalTier(f.score),r;
+  if(tier>=0){
+    var d=FEST_GOALS[tier];
+    r={coins:Math.round((d.coins+P.lvl*(tier+1)*25)*eraCoinMult()),
+       xp:Math.round(d.xp+P.lvl*(tier+1)*4),wheat:d.wheat,tier:tier};
+  }else r={coins:Math.round((20+P.lvl*5)*eraCoinMult()),xp:5,wheat:0,tier:-1};
+  f.reward=r;
+  P.festBest=Math.max(P.festBest||0,f.score);
+  P.festPlays=(P.festPlays||0)+1;
+  P.festNext=now()+FEST_COOLDOWN;
+  save();paintAll();
+  if(early){sfx('win');haptic('heavy');confettiBurst();}
+  queueFestivalResult();
+}
+function queueFestivalResult(){
+  setTimeout(function waitFest(){
+    var intro=$('intro');
+    if(modalOpen||(intro&&!intro.classList.contains('hide'))){setTimeout(waitFest,600);return;}
+    var f=festivalState();
+    if(f.done&&!f.claimed)showFestivalResult();
+  },450);
+}
+function showFestivalResult(){
+  var f=festivalState();
+  if(!f.done||f.claimed||!f.reward)return;
+  var r=f.reward,tier=r.tier==null?festivalTier(f.score):r.tier;
+  var title=tier>=0?FEST_GOALS[tier].n:'Фестиваль завершён';
+  var txt='Набрано очков: <b>'+f.score+'</b> · рекорд: <b>'+(P.festBest||f.score)+'</b><br><br>'+
+    'Твоя награда:<br><div style=\"margin:10px 0\">'+festivalRewardText(r,1)+'</div>'+
+    (tier>=0?'Ролик удвоит <b>всю награду</b>.':'Набери 12 очков, чтобы открыть первую корзину.');
+  var buttons=[];
+  if(tier>=0)buttons.push({t:'📺 Удвоить и забрать',c:'ad',f:function(){
+    var bs=document.querySelectorAll('#mBtns button');
+    for(var i=0;i<bs.length;i++)bs[i].disabled=true;
+    watchAd(function(ok){
+      if(!ok){for(var j=0;j<bs.length;j++)bs[j].disabled=false;return;}
+      claimFestival(2);
+    });
+  }});
+  buttons.push({t:'Забрать награду',c:tier>=0?'ghost':'gold',f:function(){claimFestival(1);}});
+  modal(tier>=2?'gift':'star',title,txt,buttons);
+}
+function claimFestival(mult){
+  var f=festivalState();
+  if(!f.done||f.claimed||!f.reward)return false;
+  mult=mult===2?2:1;
+  /* Флаг ставим до наград: повторный тап не сможет выдать сундук дважды. */
+  f.claimed=true;f.active=false;
+  var r=f.reward;
+  closeModal();
+  P.coins+=r.coins*mult;P.totalCoins+=r.coins*mult;
+  var wheat=r.wheat?barnAdd('wheat',r.wheat*mult):0;
+  addXp(r.xp*mult);
+  sfx('win');haptic('heavy');confettiBurst();
+  toast('🎁 Фестиваль: +'+fmt(r.coins*mult)+' монет'+(wheat?' и '+wheat+' пшеницы':''));
+  save();paintAll();return true;
+}
+function stepFestival(dt){
+  var f=festivalState();
+  if(f.active&&now()>=f.end)finishFestival(false);
+}
+function drawFestivalChip(){
+  if(!festivalActive()){G.festHud=null;return;}
+  var f=festivalState(),left=Math.max(0,(f.end-now())/1000);
+  var w=Math.min(252,W-24),h=42,x=(W-w)/2,y=boostOn()?96:62;
+  G.festHud={x:x,y:y,w:w,h:h};
+  ctx.save();
+  ctx.fillStyle='rgba(20,40,12,.42)';rrect(ctx,x,y+3,w,h,15);ctx.fill();
+  var gr=ctx.createLinearGradient(0,y,0,y+h);gr.addColorStop(0,'#fff9dc');gr.addColorStop(1,'#ffd76a');
+  ctx.fillStyle=gr;rrect(ctx,x,y,w,h,15);ctx.fill();
+  ctx.lineWidth=2;ctx.strokeStyle='rgba(255,255,255,.9)';ctx.stroke();
+  ctx.fillStyle='#6b430d';ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.font='900 13px -apple-system,Segoe UI,Roboto,sans-serif';
+  ctx.fillText('🎪 '+f.score+'/'+FEST_GOALS[2].score+'  ·  '+mmss(left),W/2,y+14);
+  var pw=w-20,pr=clamp(f.score/FEST_GOALS[2].score,0,1);
+  ctx.fillStyle='rgba(90,60,10,.2)';rrect(ctx,x+10,y+27,pw,7,4);ctx.fill();
+  if(pr>0){ctx.fillStyle='#ef8f2f';rrect(ctx,x+10,y+27,Math.max(7,pw*pr),7,4);ctx.fill();}
+  ctx.restore();
+}
+function viewFestival(){
+  stepFestival(0);
+  var f=festivalState(),h='';
+  h+='<div class=\"ord\" style=\"border-color:rgba(235,155,35,.65);background:linear-gradient(180deg,#fffdf4,#ffedc2)\">';
+  h+='<div class=\"who\">'+icoTag('gift',34)+'<b>Фестиваль урожая <span style=\"color:#e07b20\">NEW</span></b>';
+  if(festivalActive())h+='<span class=\"muted\" style=\"font-weight:900\">'+mmss((f.end-now())/1000)+'</span>';
+  h+='</div>';
+  if(festivalActive()){
+    var pr=clamp(f.score/FEST_GOALS[2].score*100,0,100);
+    h+='<div class=\"muted\" style=\"margin-bottom:8px\">Очки: <b style=\"color:#b56a08;font-size:16px\">'+f.score+'</b> / '+FEST_GOALS[2].score+
+       ' · рекорд '+(P.festBest||0)+'</div>'+
+       '<div style=\"height:9px;border-radius:99px;background:rgba(60,100,40,.18);overflow:hidden;margin-bottom:9px\">'+
+       '<div style=\"height:100%;width:'+pr+'%;background:linear-gradient(90deg,#ffd964,#ef8f2f)\"></div></div>'+
+       '<div class=\"muted\" style=\"margin-bottom:9px\">🌾 урожай +1 · 🥚 продукт +2 · 🥖 цех +4<br>🚚 заказ +10 · 🎪 ярмарка +8</div>'+
+       '<div class=\"foot\"><button class=\"btn sm gold\" id=\"festPlay\">Играть</button>'+
+       (f.extended?'<button class=\"btn sm ghost\" disabled>+30 сек использовано</button>':
+        '<button class=\"btn sm ad\" id=\"festExtend\">📺 +30 сек</button>')+'</div>';
+  }else if(f.done&&!f.claimed&&f.reward){
+    h+='<div class=\"muted\" style=\"margin-bottom:9px\">Забег окончен: <b>'+f.score+' очков</b>. Сундук ждёт — награда не пропадёт.</div>'+
+       '<div style=\"margin-bottom:10px\">'+festivalRewardText(f.reward,1)+'</div>'+
+       '<div class=\"foot\"><button class=\"btn sm gold\" id=\"festResult\">Открыть сундук</button></div>';
+  }else{
+    var left=Math.max(0,(P.festNext||0)-now());
+    h+='<div class=\"muted\" style=\"margin-bottom:9px\">90 секунд активной игры. Награды на <b>12, 30 и 55 очков</b>.<br>'+
+       '🌾 +1 · 🥚 +2 · 🥖 +4 · 🚚 +10 · 🎪 ярмарка +8<br>'+
+       'Совет: сначала подготовь урожай и товары, потом запускай забег.</div>'+
+       '<div class=\"muted\" style=\"margin-bottom:9px\">🏆 Рекорд: <b>'+(P.festBest||0)+'</b> · забегов: <b>'+(P.festPlays||0)+'</b></div>'+
+       '<div class=\"foot\">'+(left>0?
+         '<span class=\"muted\" style=\"font-weight:800\">⏳ '+mmss(left/1000)+'</span><button class=\"btn sm ad\" id=\"festAdStart\">📺 Начать сейчас</button>':
+         '<button class=\"btn sm gold\" id=\"festStart\">🎪 Начать бесплатно</button>')+'</div>';
+  }
+  return h+'</div>';
 }
 
 /* Детали лужайки: кустики, цветы, камешки, дорожка.
@@ -6009,6 +6220,7 @@ function viewBarn(){
 /* ---------- ещё ---------- */
 function viewMore(){
   var h='';
+  h+='<div class="sec">Новое событие 🎪</div>'+viewFestival();
   /* эпоха фермы — бесконечный прогресс */
   var nextM=[];
   MACHINES.forEach(function(m){if((m.era|0)===eraNum()+1)nextM.push(m.n);});
@@ -6107,10 +6319,11 @@ function viewMore(){
       'Выполни все три — получишь <b>бонус-сундук</b> 🎁')+'</div>';
   /* награды за рекламу */
   h+='<div class="sec">Бонусы за ролик</div>';
+  var acd=adLeft(P.adCoinsAt,AD_COINS_CD);
   h+='<div class="ord"><div class="who">'+icoTag('coin',34)+'<b>Мешок монет</b></div>'+
-     '<div class="muted" style="margin-bottom:9px">Быстрые деньги на семена и постройки.</div>'+
-     '<div class="foot"><div class="rew"><span>'+icoTag('coin',17)+fmt(120+P.lvl*45)+'</span></div>'+
-     '<button class="btn sm ad" id="adCoins">📺 Забрать</button></div></div>';
+     '<div class="muted" style="margin-bottom:9px">Быстрые деньги на семена и постройки. Доступно раз в 5 минут.</div>'+
+     '<div class="foot"><div class="rew"><span>'+icoTag('coin',17)+fmt(Math.round((120+P.lvl*45)*eraCoinMult()))+'</span></div>'+
+     '<button class="btn sm ad" id="adCoins"'+(acd>0?' disabled':'')+'>'+(acd>0?'⏳ '+mmss(acd/1000):'📺 Забрать')+'</button></div></div>';
 
   h+='<div class="ord"><div class="who">'+icoTag('star',34)+'<b>Ускорить всё</b></div>'+
      '<div class="muted" style="margin-bottom:9px">Урожай, звери и цеха будут готовы сразу.</div>'+
@@ -6118,11 +6331,12 @@ function viewMore(){
      'разом по всей ферме</span></div>'+
      '<button class="btn sm ad" id="adSpeed">📺 Ускорить</button></div></div>';
 
+  var bcd=adLeft(P.adBarnAt,AD_BARN_CD);
   h+='<div class="ord"><div class="who">'+icoTag('barn',34)+'<b>+10 мест в амбаре</b></div>'+
-     '<div class="muted" style="margin-bottom:9px">Бесплатное расширение склада.</div>'+
+     '<div class="muted" style="margin-bottom:9px">Бесплатное расширение склада. Доступно раз в 20 минут.</div>'+
      '<div class="foot"><div class="rew"><span class="muted" style="font-weight:700">'+
      'сейчас '+P.barnCap+' мест</span></div>'+
-     '<button class="btn sm ad" id="adBarn">📺 Расширить</button></div></div>';
+     '<button class="btn sm ad" id="adBarn"'+(bcd>0?' disabled':'')+'>'+(bcd>0?'⏳ '+mmss(bcd/1000):'📺 Расширить')+'</button></div></div>';
 
   h+='<div class="ord"><div class="who">'+icoTag('star',34)+'<b>Буст ×2 к доходу</b></div>'+
      '<div class="muted" style="margin-bottom:9px">10 минут двойных монет с продаж, заказов и наград. '+
@@ -6304,6 +6518,17 @@ function bindPanel(){
     });
   });
   tap($('daily'),function(){takeDaily();renderPanel();});
+  tap($('festStart'),function(){startFestival(false);});
+  tap($('festPlay'),closePanel);
+  tap($('festResult'),showFestivalResult);
+  tap($('festAdStart'),function(){
+    var el=$('festAdStart');if(el.disabled)return;el.disabled=true;
+    watchAd(function(ok){if(ok)startFestival(true);else{el.disabled=false;renderPanel();}});
+  });
+  tap($('festExtend'),function(){
+    var el=$('festExtend');if(el.disabled)return;el.disabled=true;
+    watchAd(function(ok){if(ok)extendFestival();else el.disabled=false;renderPanel();});
+  });
   var pg=$('petGame');if(pg)tap(pg,function(){closePanel();startPetGame();});
   var fc=$('feedCat');if(fc)tap(fc,function(){feedCat();renderPanel();});
   var bg=$('butterflyGame');if(bg)tap(bg,function(){closePanel();startButterflyGame();});
@@ -6317,10 +6542,12 @@ function bindPanel(){
     renderPanel();
   });
   tap($('adCoins'),function(){
-    var el=$('adCoins');if(el.disabled)return;el.disabled=true;
+    var el=$('adCoins');if(el.disabled)return;
+    if(adLeft(P.adCoinsAt,AD_COINS_CD)>0){toast('Мешок монет будет доступен позже');return;}
+    el.disabled=true;
     watchAd(function(ok){
       if(!ok){el.disabled=false;return;}
-      var m=120+P.lvl*45;
+      var m=Math.round((120+P.lvl*45)*eraCoinMult());P.adCoinsAt=now();
       P.coins+=m;P.totalCoins+=m;
       sfx('coin');haptic('medium');save();paintTop();
       toast('💰 +'+fmt(m)+' монет');
@@ -6329,6 +6556,7 @@ function bindPanel(){
   });
   tap($('adSpeed'),function(){
     var el=$('adSpeed');if(el.disabled)return;
+    if(!hasAnythingToSpeed()){sfx('tap');toast('Сейчас нечего ускорять — ролик не нужен');return;}
     el.disabled=true;
     watchAd(function(ok){
       if(!ok){el.disabled=false;return;}
@@ -6340,10 +6568,12 @@ function bindPanel(){
     });
   });
   tap($('adBarn'),function(){
-    var el=$('adBarn');if(el.disabled)return;el.disabled=true;
+    var el=$('adBarn');if(el.disabled)return;
+    if(adLeft(P.adBarnAt,AD_BARN_CD)>0){toast('Расширение будет доступно позже');return;}
+    el.disabled=true;
     watchAd(function(ok){
       if(!ok){el.disabled=false;return;}
-      P.barnCap+=10;
+      P.barnCap+=10;P.adBarnAt=now();
       sfx('build');haptic('medium');save();paintAll();
       toast('🏚 Амбар: +10 мест');
       renderPanel();
@@ -6464,6 +6694,10 @@ function onTap(x,y){
   if(modalOpen||PWID.paused)return;
   audioWake();
 
+  if(G.festHud&&festivalActive()){
+    var fh=G.festHud;
+    if(x>=fh.x&&x<=fh.x+fh.w&&y>=fh.y&&y<=fh.y+fh.h){sfx('tap');openPanel('more');return;}
+  }
   /* тап по воздушному шару с подарком */
   if(G.balloon&&G.balloon.active){
     var by=G.balloon.y + Math.sin(G.balloon.t*2)*4;
@@ -6694,7 +6928,9 @@ function loop(ts){
   render(dt);
   /* значок готовых заказов обновляем нечасто — это дешевле */
   badgeT+=dt;
-  if(badgeT>1.1){badgeT=0;paintBadges();refillOrders();}
+  if(badgeT>1.1){badgeT=0;paintBadges();refillOrders();
+    if(curTab==='more'&&(festivalActive()||adLeft(P.adCoinsAt,AD_COINS_CD)>0||adLeft(P.adBarnAt,AD_BARN_CD)>0))renderPanel();
+  }
 }
 
 /* ============================================================
@@ -6707,8 +6943,10 @@ function enterGame(){
   i.classList.add('hide');
   /* Заставку не удаляем: это главное меню, в него можно вернуться
      через паузу (требование модерации ВК). */
-  var rep=offlineReport();
-  if(rep.total>=3){
+  var rep=offlineReport(),pendingFest=festivalState();
+  if(pendingFest.done&&!pendingFest.claimed){
+    setTimeout(showFestivalResult,700);
+  }else if(rep.total>=3){
     setTimeout(function(){
       modal('farm','С возвращением!',
         'Пока тебя не было, на ферме поспело:<br>'+
@@ -6780,7 +7018,9 @@ collectAllAnimals:collectAllAnimals,feedAll:feedAll,getW:function(){return W;},g
   sellItem:sellItem,barnAdd:barnAdd,barnCount:barnCount,addXp:addXp,
   openPanel:openPanel,closePanel:closePanel,save:save,layout:layout,
   plotState:plotState,animalState:animalState,speedUpAll:speedUpAll,
-  ART:ART,itemPrice:itemPrice,
+  ART:ART,itemPrice:itemPrice,festivalState:festivalState,festivalActive:festivalActive,startFestival:startFestival,
+  festivalAdd:festivalAdd,extendFestival:extendFestival,finishFestival:finishFestival,claimFestival:claimFestival,
+  viewFestival:viewFestival,hasAnythingToSpeed:hasAnythingToSpeed,adLeft:adLeft,
   startPetGame:startPetGame,petGameCatch:petGameCatch,nightFactor:nightFactor,seasonName:seasonName,
   feedCat:feedCat,startButterflyGame:startButterflyGame,butterflyCatch:butterflyCatch,catPrankHit:catPrankHit,
   sfx:sfx,audioWake:audioWake,A:A,SFX_B64:SFX_B64,startFair:startFair,fairActive:fairActive,deliverFair:deliverFair,makeFairOrders:makeFairOrders,hireHelper:hireHelper,helperActive:helperActive,helpNeighbor:helpNeighbor,petDuck:petDuck,viewFair:viewFair,stepHelper:stepHelper,stepFair:stepFair,stepDuck:stepDuck,sellAllItems:sellAllItems,comboHit:comboHit,yesterdayKey:yesterdayKey,stepPetals:stepPetals,anyReady:anyReady};
@@ -6794,5 +7034,5 @@ window.__MOD={
 })();
 </script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","spa":2}' crossorigin="anonymous"></script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a57cd5e05873efdb',t:'MTc5NDIyNzQ5Nw=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a57cd5e05873efdb',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
